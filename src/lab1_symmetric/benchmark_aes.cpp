@@ -31,87 +31,91 @@ void PrintPythonArray(const string& varName, const vector<double>& times) {
 // CType: 0 = Bình thường & XTS, 1 = ECB (Không IV), 3 = AEAD (GCM, CCM)
 template<class ENC_MODE, class DEC_MODE, int CType = 0>
 void RunBench(const string& modeName, const string& sizeLabel, size_t sizeBytes, int keySize = 16) {
-    
-    // XTS Mode bắt buộc kích thước Key phải gấp đôi (32 bytes cho AES-128 XTS)
-    if (modeName == "xts") {
-        keySize = 32;
-    }
-
+    AutoSeededRandomPool prng;
     SecByteBlock key(keySize);
-    SecByteBlock iv(AES::BLOCKSIZE);
-    memset(key, 0x01, key.size());
-    memset(iv, 0x02, iv.size());
+    SecByteBlock iv(16);
+    prng.GenerateBlock(key, key.size());
+    prng.GenerateBlock(iv, iv.size());
 
-    // Cấu hình kích thước IV đặc thù cho từng chế độ AEAD
-    if (modeName == "gcm") iv.New(12); // GCM chuẩn nhất là 12 bytes IV
-    if (modeName == "ccm") iv.New(11); // CCM chuẩn nhất là 11 bytes IV
+    string pt(sizeBytes, 'A');
+    string ct, tempDump;
 
-    vector<CryptoPP::byte> plaintext(sizeBytes, 0x41);
-    vector<CryptoPP::byte> ciphertext(sizeBytes, 0);
-    vector<CryptoPP::byte> decrypted(sizeBytes, 0);
+    // FIX CHUẨN 1000%: XTS xài chung SetKeyWithIV với nhóm 0!
+    auto InitCipher = [&](auto& cipherObj) {
+        if constexpr (CType == 1) { 
+            // ECB: Tuyệt đối không dùng IV
+            cipherObj.SetKey(key, key.size()); 
+        } else if constexpr (CType == 3) {
+            // AEAD (GCM, CCM): Cần IV và SpecifyDataLengths
+            cipherObj.SetKeyWithIV(key, key.size(), iv, cipherObj.IVSize()); 
+            cipherObj.SpecifyDataLengths(0, sizeBytes, 0); 
+        } else {
+            // CTR, CBC, OFB, CFB, XTS: Dùng IV bình thường
+            cipherObj.SetKeyWithIV(key, key.size(), iv, cipherObj.IVSize()); 
+        }
+    };
 
+    // ==========================================
+    // 0. CHUẨN BỊ CIPHERTEXT
+    // ==========================================
+    ENC_MODE encSetup;
+    InitCipher(encSetup);
+
+    if constexpr (CType == 3) {
+        StringSource(pt, true, new AuthenticatedEncryptionFilter(encSetup, new StringSink(ct)));
+    } else {
+        StringSource(pt, true, new StreamTransformationFilter(encSetup, new StringSink(ct)));
+    }
+
+    // ==========================================
+    // 1. WARM-UP CPU (1 Giây)
+    // ==========================================
+    auto wStart = high_resolution_clock::now();
+    while (duration_cast<seconds>(high_resolution_clock::now() - wStart).count() < 1) {
+        ENC_MODE encW;
+        InitCipher(encW);
+        if constexpr (CType == 3) StringSource(pt, true, new AuthenticatedEncryptionFilter(encW, new StringSink(tempDump)));
+        else StringSource(pt, true, new StreamTransformationFilter(encW, new StringSink(tempDump)));
+        tempDump.clear();
+    }
+
+    // ==========================================
+    // 2. BENCHMARK ENCRYPTION
+    // ==========================================
     vector<double> encTimes;
+    for (int i = 0; i < RUNS; ++i) {
+        auto start = high_resolution_clock::now();
+        for (int j = 0; j < OPS_PER_RUN; ++j) {
+            ENC_MODE enc;
+            InitCipher(enc);
+            if constexpr (CType == 3) StringSource(pt, true, new AuthenticatedEncryptionFilter(enc, new StringSink(tempDump)));
+            else StringSource(pt, true, new StreamTransformationFilter(enc, new StringSink(tempDump)));
+            tempDump.clear();
+        }
+        auto end = high_resolution_clock::now();
+        encTimes.push_back(duration_cast<duration<double, milli>>(end - start).count());
+    }
+
+    // ==========================================
+    // 3. BENCHMARK DECRYPTION
+    // ==========================================
     vector<double> decTimes;
-
-    // Định nghĩa kích thước khối chunk nhỏ để tránh lỗi quá tải kích thước của CCM
-    size_t chunkSize = (modeName == "ccm" && sizeBytes > 256 * 1024) ? 64 * 1024 : sizeBytes;
-
-    // 1. BENCHMARK TIẾN TRÌNH MÃ HÓA (ENCRYPTION)
-    for (int r = 0; r < RUNS; ++r) {
-        ENC_MODE enc;
-        
-        if constexpr (CType == 1) {
-            enc.SetKey(key, key.size());
-        } else {
-            enc.SetKeyWithIV(key, key.size(), iv, iv.size());
-        }
-
+    for (int i = 0; i < RUNS; ++i) {
         auto start = high_resolution_clock::now();
-        for (int op = 0; op < OPS_PER_RUN; ++op) {
-            if (modeName == "ccm") {
-                // Xử lý chia nhỏ khối dữ liệu đầu vào cho CCM để chống lỗi vượt quá độ dài tối đa
-                size_t processed = 0;
-                while (processed < sizeBytes) {
-                    size_t currentChunk = min(chunkSize, sizeBytes - processed);
-                    enc.ProcessData(ciphertext.data() + processed, plaintext.data() + processed, currentChunk);
-                    processed += currentChunk;
-                }
+        for (int j = 0; j < OPS_PER_RUN; ++j) {
+            DEC_MODE dec;
+            InitCipher(dec);
+            if constexpr (CType == 3) {
+                StringSource(ct, true, new AuthenticatedDecryptionFilter(dec, new StringSink(tempDump), AuthenticatedDecryptionFilter::DEFAULT_FLAGS));
             } else {
-                enc.ProcessData(ciphertext.data(), plaintext.data(), sizeBytes);
+                StringSource(ct, true, new StreamTransformationFilter(dec, new StringSink(tempDump)));
             }
+            tempDump.clear();
         }
         auto end = high_resolution_clock::now();
-        encTimes.push_back(duration<double, std::milli>(end - start).count());
+        decTimes.push_back(duration_cast<duration<double, milli>>(end - start).count());
     }
 
-    // 2. BENCHMARK TIẾN TRÌNH GIẢI MÃ (DECRYPTION)
-    for (int r = 0; r < RUNS; ++r) {
-        DEC_MODE dec;
-        
-        if constexpr (CType == 1) {
-            dec.SetKey(key, key.size());
-        } else {
-            dec.SetKeyWithIV(key, key.size(), iv, iv.size());
-        }
-
-        auto start = high_resolution_clock::now();
-        for (int op = 0; op < OPS_PER_RUN; ++op) {
-            if (modeName == "ccm") {
-                size_t processed = 0;
-                while (processed < sizeBytes) {
-                    size_t currentChunk = min(chunkSize, sizeBytes - processed);
-                    dec.ProcessData(decrypted.data() + processed, ciphertext.data() + processed, currentChunk);
-                    processed += currentChunk;
-                }
-            } else {
-                dec.ProcessData(decrypted.data(), ciphertext.data(), sizeBytes);
-            }
-        }
-        auto end = high_resolution_clock::now();
-        decTimes.push_back(duration<double, std::milli>(end - start).count());
-    }
-
-    // Xuất mảng dữ liệu ra console đồng bộ chuẩn Python
     PrintPythonArray(modeName + "_enc_" + sizeLabel, encTimes);
     PrintPythonArray(modeName + "_dec_" + sizeLabel, decTimes);
 }
@@ -128,20 +132,21 @@ int main() {
     for (const auto& p : payloads) {
         cout << "# --- Payload: " << p.first << " ---" << endl;
         
-        // CType = 0: Chế độ thông thường & XTS
+        // CType = 0 (Bình thường + XTS)
         RunBench<CTR_Mode<AES>::Encryption, CTR_Mode<AES>::Decryption, 0>("ctr", p.first, p.second);
         RunBench<CBC_Mode<AES>::Encryption, CBC_Mode<AES>::Decryption, 0>("cbc", p.first, p.second);
         RunBench<OFB_Mode<AES>::Encryption, OFB_Mode<AES>::Decryption, 0>("ofb", p.first, p.second);
         RunBench<CFB_Mode<AES>::Encryption, CFB_Mode<AES>::Decryption, 0>("cfb", p.first, p.second);
-        RunBench<XTS_Mode<AES>::Encryption, XTS_Mode<AES>::Decryption, 0>("xts", p.first, p.second);
+        RunBench<XTS_Mode<AES>::Encryption, XTS_Mode<AES>::Decryption, 0>("xts", p.first, p.second, 32);
         
-        // CType = 1: Chế độ không dùng IV (ECB)
+        // CType = 1 (Chỉ có ECB)
         RunBench<ECB_Mode<AES>::Encryption, ECB_Mode<AES>::Decryption, 1>("ecb", p.first, p.second);
         
-        // CType = 3: Chế độ xác thực AEAD (GCM & CCM)
+        // CType = 3 (Nhóm AEAD - GCM, CCM)
         RunBench<GCM<AES>::Encryption, GCM<AES>::Decryption, 3>("gcm", p.first, p.second);
         RunBench<CCM<AES, 16>::Encryption, CCM<AES, 16>::Decryption, 3>("ccm", p.first, p.second);
+        
+        cout << endl;
     }
-
     return 0;
 }
