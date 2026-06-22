@@ -12,8 +12,13 @@ endif()
 
 find_package(OpenSSL REQUIRED)
 
-include_directories("C:/msys64/mingw64/include")
-set(CRYPTOPP_LIBRARY "C:/msys64/mingw64/lib/libcryptopp.a")
+if(WIN32)
+    include_directories("C:/msys64/mingw64/include")
+    set(CRYPTOPP_LIBRARY "C:/msys64/mingw64/lib/libcryptopp.a")
+else()
+    include_directories(/usr/include)
+    find_library(CRYPTOPP_LIBRARY NAMES cryptopp REQUIRED)
+endif()
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src/common)
 

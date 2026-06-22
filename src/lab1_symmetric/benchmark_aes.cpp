@@ -53,6 +53,9 @@ void RunBench(const string& modeName, const string& sizeLabel, size_t sizeBytes,
     vector<double> encTimes;
     vector<double> decTimes;
 
+    // Định nghĩa kích thước khối chunk nhỏ để tránh lỗi quá tải kích thước của CCM
+    size_t chunkSize = (modeName == "ccm" && sizeBytes > 256 * 1024) ? 64 * 1024 : sizeBytes;
+
     // 1. BENCHMARK TIẾN TRÌNH MÃ HÓA (ENCRYPTION)
     for (int r = 0; r < RUNS; ++r) {
         ENC_MODE enc;
@@ -65,7 +68,17 @@ void RunBench(const string& modeName, const string& sizeLabel, size_t sizeBytes,
 
         auto start = high_resolution_clock::now();
         for (int op = 0; op < OPS_PER_RUN; ++op) {
-            enc.ProcessData(ciphertext.data(), plaintext.data(), sizeBytes);
+            if (modeName == "ccm") {
+                // Xử lý chia nhỏ khối dữ liệu đầu vào cho CCM để chống lỗi vượt quá độ dài tối đa
+                size_t processed = 0;
+                while (processed < sizeBytes) {
+                    size_t currentChunk = min(chunkSize, sizeBytes - processed);
+                    enc.ProcessData(ciphertext.data() + processed, plaintext.data() + processed, currentChunk);
+                    processed += currentChunk;
+                }
+            } else {
+                enc.ProcessData(ciphertext.data(), plaintext.data(), sizeBytes);
+            }
         }
         auto end = high_resolution_clock::now();
         encTimes.push_back(duration<double, std::milli>(end - start).count());
@@ -83,7 +96,16 @@ void RunBench(const string& modeName, const string& sizeLabel, size_t sizeBytes,
 
         auto start = high_resolution_clock::now();
         for (int op = 0; op < OPS_PER_RUN; ++op) {
-            dec.ProcessData(decrypted.data(), ciphertext.data(), sizeBytes);
+            if (modeName == "ccm") {
+                size_t processed = 0;
+                while (processed < sizeBytes) {
+                    size_t currentChunk = min(chunkSize, sizeBytes - processed);
+                    dec.ProcessData(decrypted.data() + processed, ciphertext.data() + processed, currentChunk);
+                    processed += currentChunk;
+                }
+            } else {
+                dec.ProcessData(decrypted.data(), ciphertext.data(), sizeBytes);
+            }
         }
         auto end = high_resolution_clock::now();
         decTimes.push_back(duration<double, std::milli>(end - start).count());
@@ -116,9 +138,9 @@ int main() {
         // CType = 1: Chế độ không dùng IV (ECB)
         RunBench<ECB_Mode<AES>::Encryption, ECB_Mode<AES>::Decryption, 1>("ecb", p.first, p.second);
         
-        // CType = 3: Chế độ xác thực AEAD (GCM & CCM) - Chạy mượt qua ProcessData
+        // CType = 3: Chế độ xác thực AEAD (GCM & CCM)
         RunBench<GCM<AES>::Encryption, GCM<AES>::Decryption, 3>("gcm", p.first, p.second);
-        RunBench<CCM<AES>::Encryption, CCM<AES>::Decryption, 3>("ccm", p.first, p.second);
+        RunBench<CCM<AES, 16>::Encryption, CCM<AES, 16>::Decryption, 3>("ccm", p.first, p.second);
     }
 
     return 0;
