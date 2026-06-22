@@ -1,5 +1,15 @@
+include_directories(C:/msys64/mingw64/include)
+
 add_executable(hashtool hashtool.cpp)
 add_executable(benchmark_hash benchmark_hash.cpp)
+add_executable(pkitool pkitool.cpp)
 
-target_link_libraries(hashtool PRIVATE crypto)
-target_link_libraries(benchmark_hash PRIVATE crypto)
+if(WIN32)
+    target_link_libraries(hashtool PRIVATE cryptopp crypto ws2_32 crypt32 advapi32)
+    target_link_libraries(benchmark_hash PRIVATE cryptopp crypto ws2_32 crypt32 advapi32)
+    target_link_libraries(pkitool PRIVATE cryptopp crypto ws2_32 crypt32 advapi32)
+else()
+    target_link_libraries(hashtool PRIVATE cryptopp crypto pthread m)
+    target_link_libraries(benchmark_hash PRIVATE cryptopp crypto pthread m)
+    target_link_libraries(pkitool PRIVATE cryptopp crypto pthread m)
+endif()
