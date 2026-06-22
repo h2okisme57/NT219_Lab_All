@@ -1,0 +1,26 @@
+# CMAKE build outputs
+/build/
+/.cmake/
+/out/
+CMakeUserPresets.json
+
+# Compilations & Libraries
+*.exe
+*.dll
+*.so
+*.dylib
+*.a
+*.lib
+*.o
+*.obj
+
+# IDE configurations
+.vscode/
+.idea/
+*.user
+*.suo
+*.workspace
+
+# OS junk
+.DS_Store
+Thumbs.db
