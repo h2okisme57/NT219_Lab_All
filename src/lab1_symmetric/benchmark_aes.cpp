@@ -1,119 +1,125 @@
-#include <cryptopp/aes.h>
-#include <cryptopp/modes.h>
-#include <cryptopp/filters.h>
-#include <cryptopp/osrng.h>
 #include <iostream>
 #include <vector>
 #include <chrono>
-#include <numeric>
-#include <cmath>
-#include <algorithm>
 #include <iomanip>
 #include <string>
 
+#include <cryptopp/aes.h>
+#include <cryptopp/modes.h>
+#include <cryptopp/gcm.h>
+#include <cryptopp/ccm.h>
+#include <cryptopp/xts.h>
+#include <cryptopp/osrng.h>
+#include <cryptopp/filters.h>
+
 using namespace std;
+using namespace CryptoPP;
 using namespace std::chrono;
 
 const int RUNS = 30;
+const int OPS_PER_RUN = 1000;
 
-struct StatResult {
-    double mean, median, stddev, ci95;
-};
-
-// Hàm tính toán các thông số thống kê cho thông lượng (Throughput)
-StatResult CalcStats(const vector<double>& throughputs) {
-    size_t n = throughputs.size();
-    if (n == 0) return {0,0,0,0};
-
-    double sum = accumulate(throughputs.begin(), throughputs.end(), 0.0);
-    double mean = sum / n;
-
-    vector<double> sorted = throughputs;
-    sort(sorted.begin(), sorted.end());
-    double median = (n % 2 == 0) ? (sorted[n/2 - 1] + sorted[n/2]) / 2.0 : sorted[n/2];
-
-    double sq_sum = 0.0;
-    for (double v : throughputs) sq_sum += (v - mean) * (v - mean);
-    double stddev = sqrt(sq_sum / (n > 1 ? n - 1 : 1));
-    double ci95 = 1.96 * (stddev / sqrt(n));
-
-    return {mean, median, stddev, ci95};
+// Hàm in mảng chuẩn Python
+void PrintPythonArray(const string& varName, const vector<double>& times) {
+    cout << varName << " = [";
+    for (size_t i = 0; i < times.size(); ++i) {
+        cout << fixed << setprecision(3) << times[i] << (i == times.size() - 1 ? "" : ", ");
+    }
+    cout << "]" << endl;
 }
 
-// Hàm template thực thi stress test hiệu năng từng chế độ mã hóa
-template <typename CipherModeEncryption>
-void run_benchmark(const string& mode_name, size_t size_bytes, const string& size_label) {
-    // Dùng trực tiếp CryptoPP::byte để tránh xung đột namespace với std::byte trên C++17
-    vector<CryptoPP::byte> plaintext(size_bytes, 0x41); // Ký tự 'A'
-    vector<CryptoPP::byte> ciphertext(size_bytes, 0);
+// CType: 0 = Bình thường & XTS, 1 = ECB (Không IV), 3 = AEAD (GCM, CCM)
+template<class ENC_MODE, class DEC_MODE, int CType = 0>
+void RunBench(const string& modeName, const string& sizeLabel, size_t sizeBytes, int keySize = 16) {
+    
+    // XTS Mode bắt buộc kích thước Key phải gấp đôi (32 bytes cho AES-128 XTS)
+    if (modeName == "xts") {
+        keySize = 32;
+    }
 
-    CryptoPP::byte key[CryptoPP::AES::DEFAULT_KEYLENGTH] = {0};
-    CryptoPP::byte iv[CryptoPP::AES::BLOCKSIZE] = {0};
+    SecByteBlock key(keySize);
+    SecByteBlock iv(AES::BLOCKSIZE);
+    memset(key, 0x01, key.size());
+    memset(iv, 0x02, iv.size());
 
-    vector<double> throughputs;
+    // Cấu hình kích thước IV đặc thù cho từng chế độ AEAD
+    if (modeName == "gcm") iv.New(12); // GCM chuẩn nhất là 12 bytes IV
+    if (modeName == "ccm") iv.New(11); // CCM chuẩn nhất là 11 bytes IV
 
-    for (int i = 0; i < RUNS; ++i) {
-        CipherModeEncryption enc;
+    vector<CryptoPP::byte> plaintext(sizeBytes, 0x41);
+    vector<CryptoPP::byte> ciphertext(sizeBytes, 0);
+    vector<CryptoPP::byte> decrypted(sizeBytes, 0);
 
-        // GIẢI PHÁP TRIỆT ĐỂ: Dùng chế độ nạp tham số động an toàn của Crypto++
-        // Nếu thuật toán có IVSize > 0 thì nạp cả Key và IV, ngược lại (như ECB) chỉ nạp Key thuần túy
-        if (enc.IVSize() > 0) {
-            enc.SetKeyWithIV(key, sizeof(key), iv, enc.IVSize());
+    vector<double> encTimes;
+    vector<double> decTimes;
+
+    // 1. BENCHMARK TIẾN TRÌNH MÃ HÓA (ENCRYPTION)
+    for (int r = 0; r < RUNS; ++r) {
+        ENC_MODE enc;
+        
+        if constexpr (CType == 1) {
+            enc.SetKey(key, key.size());
         } else {
-            enc.SetKey(key, sizeof(key));
+            enc.SetKeyWithIV(key, key.size(), iv, iv.size());
         }
 
         auto start = high_resolution_clock::now();
-        
-        // Gọi ProcessData xử lý mã hóa tuyến tính trên mảng byte
-        enc.ProcessData(ciphertext.data(), plaintext.data(), size_bytes);
-        
-        auto end = high_resolution_clock::now();
-        
-        double duration_sec = duration<double>(end - start).count();
-
-        // Tính thông lượng theo băng thông: MB/s = (Bytes / 1024 / 1024) / Giây
-        if (duration_sec > 0) {
-            double mb_per_sec = (static_cast<double>(size_bytes) / (1024.0 * 1024.0)) / duration_sec;
-            throughputs.push_back(mb_per_sec);
-        } else {
-            throughputs.push_back(0.0);
+        for (int op = 0; op < OPS_PER_RUN; ++op) {
+            enc.ProcessData(ciphertext.data(), plaintext.data(), sizeBytes);
         }
+        auto end = high_resolution_clock::now();
+        encTimes.push_back(duration<double, std::milli>(end - start).count());
     }
 
-    StatResult res = CalcStats(throughputs);
+    // 2. BENCHMARK TIẾN TRÌNH GIẢI MÃ (DECRYPTION)
+    for (int r = 0; r < RUNS; ++r) {
+        DEC_MODE dec;
+        
+        if constexpr (CType == 1) {
+            dec.SetKey(key, key.size());
+        } else {
+            dec.SetKeyWithIV(key, key.size(), iv, iv.size());
+        }
 
-    // Xuất kết quả ra console theo định dạng bảng đồng bộ
-    cout << "| " << left << setw(12) << mode_name 
-         << " | " << setw(9) << size_label 
-         << " | " << fixed << setprecision(2) << setw(11) << res.mean 
-         << " | " << setw(11) << res.median 
-         << " | " << setw(10) << res.stddev 
-         << " | [" << setprecision(2) << res.mean - res.ci95 << ", " << res.mean + res.ci95 << "] |\n";
+        auto start = high_resolution_clock::now();
+        for (int op = 0; op < OPS_PER_RUN; ++op) {
+            dec.ProcessData(decrypted.data(), ciphertext.data(), sizeBytes);
+        }
+        auto end = high_resolution_clock::now();
+        decTimes.push_back(duration<double, std::milli>(end - start).count());
+    }
+
+    // Xuất mảng dữ liệu ra console đồng bộ chuẩn Python
+    PrintPythonArray(modeName + "_enc_" + sizeLabel, encTimes);
+    PrintPythonArray(modeName + "_dec_" + sizeLabel, decTimes);
 }
 
 int main() {
-    cout << "======================================================================================\n";
-    cout << "| Che do       | Payload   | Mean (MB/s) | Median (MB/s) | StdDev     | Khoang tin cay 95%     |\n";
-    cout << "--------------------------------------------------------------------------------------\n";
-
-    // Danh sách các mức payload kiểm thử stress test CPU
-    vector<pair<size_t, string>> sizes = {
-        {1024, "1 KB"},
-        {4096, "4 KB"},
-        {16384, "16 KB"},
-        {262144, "266 KB"},
-        {1024 * 1024, "1 MB"},
-        {8 * 1024 * 1024, "8 MB"}
+    vector<pair<string, size_t>> payloads = {
+        {"1KB", 1024}, {"4KB", 4096}, {"16KB", 16384},
+        {"256KB", 262144}, {"1MB", 1048576}, {"8MB", 8388608}
     };
 
-    // Gọi chạy an toàn không qua ép kiểu compile-time lỗi mẫu
-    for (const auto& s : sizes) run_benchmark<CryptoPP::ECB_Mode<CryptoPP::AES>::Encryption>("AES-ECB", s.first, s.second);
-    for (const auto& s : sizes) run_benchmark<CryptoPP::CBC_Mode<CryptoPP::AES>::Encryption>("AES-CBC", s.first, s.second);
-    for (const auto& s : sizes) run_benchmark<CryptoPP::OFB_Mode<CryptoPP::AES>::Encryption>("AES-OFB", s.first, s.second);
-    for (const auto& s : sizes) run_benchmark<CryptoPP::CFB_Mode<CryptoPP::AES>::Encryption>("AES-CFB", s.first, s.second);
-    for (const auto& s : sizes) run_benchmark<CryptoPP::CTR_Mode<CryptoPP::AES>::Encryption>("AES-CTR", s.first, s.second);
+    cout << "# ========== FULL AES BENCHMARK (ENC & DEC) FOR PYTHON ==========" << endl;
+    cout << "repetitions = list(range(1, 31))" << endl << endl;
 
-    cout << "======================================================================================\n";
+    for (const auto& p : payloads) {
+        cout << "# --- Payload: " << p.first << " ---" << endl;
+        
+        // CType = 0: Chế độ thông thường & XTS
+        RunBench<CTR_Mode<AES>::Encryption, CTR_Mode<AES>::Decryption, 0>("ctr", p.first, p.second);
+        RunBench<CBC_Mode<AES>::Encryption, CBC_Mode<AES>::Decryption, 0>("cbc", p.first, p.second);
+        RunBench<OFB_Mode<AES>::Encryption, OFB_Mode<AES>::Decryption, 0>("ofb", p.first, p.second);
+        RunBench<CFB_Mode<AES>::Encryption, CFB_Mode<AES>::Decryption, 0>("cfb", p.first, p.second);
+        RunBench<XTS_Mode<AES>::Encryption, XTS_Mode<AES>::Decryption, 0>("xts", p.first, p.second);
+        
+        // CType = 1: Chế độ không dùng IV (ECB)
+        RunBench<ECB_Mode<AES>::Encryption, ECB_Mode<AES>::Decryption, 1>("ecb", p.first, p.second);
+        
+        // CType = 3: Chế độ xác thực AEAD (GCM & CCM) - Chạy mượt qua ProcessData
+        RunBench<GCM<AES>::Encryption, GCM<AES>::Decryption, 3>("gcm", p.first, p.second);
+        RunBench<CCM<AES>::Encryption, CCM<AES>::Decryption, 3>("ccm", p.first, p.second);
+    }
+
     return 0;
 }
